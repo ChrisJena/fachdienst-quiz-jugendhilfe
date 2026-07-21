@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Fachdienst im Dialog – Mitspielen</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="app-page">
+  <main class="mobile-screen" id="screen">
+    <section class="app-card">
+      <div id="loadingView">
+        <span class="app-status">Fachdienst im Dialog</span>
+        <h1>Quiz wird geladen …</h1>
+      </div>
+
+      <div id="joinView" class="hidden">
+        <span class="app-status">Fachdienst im Dialog · 02.09.2026</span>
+        <h1>Wie gut kenne ich meinen Fachdienst?</h1>
+        <p>Gib einen Namen oder Spitznamen ein und spiele mit.</p>
+        <input id="playerName" maxlength="24" autocomplete="nickname" placeholder="Name oder Spitzname">
+        <button id="joinButton">Am Quiz teilnehmen</button>
+      </div>
+
+      <div id="waitingView" class="hidden">
+        <span class="app-status">Du bist dabei</span>
+        <h2>Bitte auf die nächste Frage warten.</h2>
+        <p id="welcomeText"></p>
+      </div>
+
+      <div id="questionView" class="hidden">
+        <span class="app-status" id="questionNumber"></span>
+        <h2 id="questionText"></h2>
+        <input id="guessInput" type="number" step="1" inputmode="numeric" placeholder="Deine Schätzung">
+        <button id="submitGuess">Schätzung abgeben</button>
+      </div>
+
+      <div id="submittedView" class="hidden">
+        <span class="app-status">Antwort gespeichert</span>
+        <h2>Danke!</h2>
+        <p>Bitte blicke wieder auf die Präsentationsfläche.</p>
+      </div>
+    </section>
+  </main>
+
+  <script src="lib/xlsx.full.min.js"></script>
+  <script src="js/config.js"></script>
+  <script src="js/app.js"></script>
+  <script>
+    const views = ["loadingView", "joinView", "waitingView", "questionView", "submittedView"];
+    const show = id => views.forEach(view => document.getElementById(view).classList.toggle("hidden", view !== id));
+
+    document.getElementById("joinButton").addEventListener("click", () => {
+      const name = document.getElementById("playerName").value.trim();
+      if (!name) return alert("Bitte gib einen Namen oder Spitznamen ein.");
+      localStorage.setItem("quizPlayerName", name);
+      document.getElementById("welcomeText").textContent = `Willkommen, ${name}!`;
+      show("waitingView");
+    });
+
+    document.getElementById("submitGuess").addEventListener("click", () => {
+      const input = document.getElementById("guessInput");
+      if (input.value === "") return alert("Bitte gib eine ganze Zahl ein.");
+      if (!Number.isInteger(Number(input.value))) return alert("Bitte verwende keine Nachkommastellen.");
+      show("submittedView");
+    });
+
+    async function initialize() {
+      try {
+        await QuizUtils.loadQuestions();
+        const q = Number(new URLSearchParams(location.search).get("q"));
+        if (q >= 1 && q <= window.QUIZ_QUESTIONS.length) {
+          const item = QuizUtils.getQuestion(q - 1);
+          QuizUtils.setBackground(document.getElementById("screen"), item.background);
+          document.getElementById("questionNumber").textContent = `Frage ${q} von ${window.QUIZ_QUESTIONS.length}`;
+          document.getElementById("questionText").textContent = item.question;
+          show("questionView");
+        } else {
+          show("joinView");
+        }
+      } catch (error) {
+        document.querySelector(".app-card").classList.add("hidden");
+        QuizUtils.showLoadError(error, document.getElementById("screen"));
+      }
+    }
+
+    initialize();
+  </script>
+</body>
+</html>
