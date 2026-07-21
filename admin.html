@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Fachdienst im Dialog – Moderation</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="admin-page admin-locked">
+  <main class="admin-gate" id="adminGate">
+    <section class="admin-login-card" aria-labelledby="adminLoginTitle">
+      <span class="app-status">Geschützter Bereich</span>
+      <h1 id="adminLoginTitle">Moderation öffnen</h1>
+      <p>Melde dich mit deinem eingerichteten Quiz-Admin-Konto an.</p>
+      <form id="adminLoginForm">
+        <label for="adminEmail">E-Mail-Adresse</label>
+        <input id="adminEmail" type="email" autocomplete="username" required>
+        <label for="adminPassword">Passwort</label>
+        <input id="adminPassword" type="password" autocomplete="current-password" required>
+        <button id="adminLoginButton" type="submit">Sicher anmelden</button>
+      </form>
+      <p class="admin-login-message" id="adminLoginMessage" role="alert" aria-live="polite"></p>
+    </section>
+  </main>
+
+  <main class="admin-shell" id="adminShell" hidden>
+    <section class="admin-card">
+      <div class="admin-heading">
+        <div>
+          <span class="app-status">Moderationsansicht</span>
+          <h1>Fachdienst Live-Quiz</h1>
+        </div>
+        <div class="admin-heading-actions">
+          <span class="admin-account" id="adminAccount"></span>
+          <span class="excel-status loading" id="excelStatus">Excel wird geprüft …</span>
+          <button class="admin-logout" id="adminLogout" type="button">Abmelden</button>
+        </div>
+      </div>
+
+      <div class="admin-metrics">
+        <div><span>Teilnehmende</span><strong id="players">0</strong></div>
+        <div><span>Antworten aktuelle Frage</span><strong id="answers">0</strong></div>
+      </div>
+
+      <div class="current-question">
+        <small id="adminMeta">Live-Verbindung wird aufgebaut …</small>
+        <h2 id="adminQuestion">Quizstatus wird geladen …</h2>
+      </div>
+
+      <div class="admin-actions">
+        <button id="startQuiz">Quiz freigeben</button>
+        <button id="showQuestion">Erste Frage anzeigen</button>
+        <button id="startTimer" class="accent">Countdown starten</button>
+        <button id="closeAnswers">Antworten schließen</button>
+        <button id="showSolution">Auflösung anzeigen</button>
+        <button id="nextQuestion">Nächste Frage</button>
+        <button id="showRanking">Finale Rangliste</button>
+        <button id="resetQuiz" class="secondary">Quiz zurücksetzen</button>
+      </div>
+
+      <p class="admin-note" id="adminNote" role="status" aria-live="polite">Nach der Anmeldung wird der aktuelle Live-Stand geladen.</p>
+    </section>
+  </main>
+
+  <script src="lib/xlsx.full.min.js"></script>
+  <script src="lib/supabase.js"></script>
+  <script src="js/config.js"></script>
+  <script src="js/app.js"></script>
+  <script src="js/live.js"></script>
+  <script>
+    (function () {
+      "use strict";
+
+      const actionMap = {
+        showQuestion: "show_question",
+        startTimer: "start_timer",
+        closeAnswers: "close_answers",
+        showSolution: "show_solution",
+        nextQuestion: "next_question",
+        showRanking: "show_ranking"
+      };
+      const buttons = Object.fromEntries(
+        ["startQuiz", "showQuestion", "startTimer", "closeAnswers", "showSolution", "nextQuestion", "showRanking", "resetQuiz"]
+          .map(id => [id, document.getElementById(id)])
+      );
+      let questionsReady = false;
+      let initialized = false;
+      let state = null;
+      let unsubscribe = null;
+      let autoCloseId = null;
+
+      function note(value, isError = false) {
+        const element = document.getElementById("adminNote");
+        element.textContent = value;
+        element.classList.toggle("error", isError);
+      }
+
+      function setBusy(busy) {
+        Object.values(buttons).forEach(button => button.disabled = busy || button.disabled);
+        document.body.classList.toggle("admin-busy", busy);
+      }
+
+      function render(currentState) {
+        state = currentState;
+        document.getElementById("players").textContent = currentState.player_count || 0;
+        document.getElementById("answers").textContent = currentState.answer_count || 0;
+
+        const hasQuestion = Number(currentState.question_count) > 0;
+        const meta = hasQuestion
+          ? `Frage ${currentState.current_question} von ${currentState.question_count} · Status: ${currentState.status}`
+          : "Noch keine Fragen an Supabase übertragen";
+        document.getElementById("adminMeta").textContent = meta;
+        document.getElementById("adminQuestion").textContent = currentState.question_text
+          || (currentState.status === "lobby" ? "Teilnehmende können jetzt beitreten." : "Quiz ist bereit zur Einrichtung.");
+
+        buttons.startQuiz.disabled = !questionsReady || currentState.status !== "setup";
+        buttons.showQuestion.disabled = currentState.status !== "lobby";
+        buttons.startTimer.disabled = currentState.status !== "question";
+        buttons.closeAnswers.disabled = currentState.status !== "accepting";
+        buttons.showSolution.disabled = currentState.status !== "closed";
+        buttons.nextQuestion.disabled = currentState.status !== "solution" || currentState.current_question >= currentState.question_count;
+        buttons.showRanking.disabled = currentState.status !== "solution" || currentState.current_question < currentState.question_count;
+        buttons.resetQuiz.disabled = currentState.status === "setup" && Number(currentState.player_count) === 0;
+
+        if (autoCloseId) window.clearTimeout(autoCloseId);
+        autoCloseId = null;
+        if (currentState.status === "accepting" && currentState.answer_deadline) {
+          const delay = Math.max(0, Date.parse(currentState.answer_deadline) - Date.now() + 350);
+          autoCloseId = window.setTimeout(async () => {
+            try { await QuizLive.adminAction("close_answers"); }
+            catch (error) { note(QuizUtils.errorMessage(error), true); }
+          }, delay);
+        }
+      }
+
+      async function runAction(action, successText) {
+        if (!state) return;
+        setBusy(true);
+        note("Aktion wird übertragen …");
+        try {
+          await QuizLive.adminAction(action);
+          render(await QuizLive.getState());
+          note(successText);
+        } catch (error) {
+          note(QuizUtils.errorMessage(error), true);
+        } finally {
+          setBusy(false);
+          if (state) render(state);
+        }
+      }
+
+      buttons.startQuiz.addEventListener("click", async () => {
+        setBusy(true);
+        note("Excel-Fragen werden übertragen und das Quiz wird freigegeben …");
+        try {
+          const count = await QuizLive.syncQuestions(window.QUIZ_QUESTIONS);
+          await QuizLive.adminAction("start_quiz");
+          render(await QuizLive.getState());
+          note(`${count} Fragen übertragen. Teilnehmende können jetzt beitreten.`);
+        } catch (error) {
+          note(QuizUtils.errorMessage(error), true);
+        } finally {
+          setBusy(false);
+          if (state) render(state);
+        }
+      });
+
+      Object.entries(actionMap).forEach(([id, action]) => {
+        buttons[id].addEventListener("click", () => runAction(action, "Live-Ansichten wurden aktualisiert."));
+      });
+
+      buttons.resetQuiz.addEventListener("click", async () => {
+        if (!confirm("Quiz wirklich zurücksetzen? Alle Teilnehmenden, Antworten und Punkte werden gelöscht.")) return;
+        await runAction("reset_quiz", "Quiz zurückgesetzt. Für einen neuen Durchlauf bitte erneut freigeben.");
+      });
+
+      async function initializeAdmin() {
+        if (initialized) return;
+        initialized = true;
+        const status = document.getElementById("excelStatus");
+        try {
+          await QuizUtils.loadQuestions();
+          questionsReady = true;
+          status.className = "excel-status ready";
+          status.textContent = `${window.QUIZ_QUESTIONS.length} aktive Fragen geladen`;
+          note("Live-Verbindung wird aufgebaut …");
+          unsubscribe = QuizLive.subscribeState(render, error => note(QuizUtils.errorMessage(error), true));
+        } catch (error) {
+          status.className = "excel-status error";
+          status.textContent = "Fehler in der Excel-Datei";
+          note(QuizUtils.errorMessage(error), true);
+          Object.values(buttons).forEach(button => button.disabled = true);
+        }
+      }
+
+      window.addEventListener("quiz-admin-ready", initializeAdmin);
+      window.addEventListener("beforeunload", () => {
+        if (unsubscribe) unsubscribe();
+        if (autoCloseId) window.clearTimeout(autoCloseId);
+      });
+    })();
+  </script>
+  <script src="js/admin-auth.js"></script>
+</body>
+</html>

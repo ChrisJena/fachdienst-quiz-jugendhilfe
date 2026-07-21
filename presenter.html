@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Fachdienst im Dialog – Quiz</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="presenter-page">
+  <main class="quiz-stage" id="quizStage">
+    <section class="quiz-content" aria-live="polite">
+      <div class="question-meta" id="questionMeta">
+        <span class="question-number" id="questionNumber">Live-Quiz</span>
+        <span class="round-title" id="roundTitle">Fachdienst im Dialog</span>
+      </div>
+
+      <section id="loadingState" class="state-panel center-state">
+        <span class="connection-dot"></span>
+        <h1 class="state-title">Live-Verbindung wird aufgebaut …</h1>
+      </section>
+
+      <section id="lobbyState" class="state-panel center-state hidden">
+        <p class="solution-label">Wie gut kenne ich meinen Fachdienst?</p>
+        <h1 class="state-title">Willkommen zum Live-Quiz!</h1>
+        <div class="lobby-count"><strong id="lobbyPlayers">0</strong><span>Teilnehmende sind dabei</span></div>
+        <p class="instruction">Spitznamen eingeben – der Start erfolgt gleich.</p>
+      </section>
+
+      <section id="questionState" class="state-panel hidden">
+        <h1 class="question-text" id="questionText"></h1>
+        <p class="instruction" id="presenterInstruction">Schätzung jetzt auf dem Smartphone abgeben.</p>
+
+        <div class="live-row">
+          <div class="timer" id="timer" aria-label="Verbleibende Zeit">
+            <span id="countdown">30</span><small>Sekunden</small>
+          </div>
+          <div class="answer-progress">
+            <strong id="answerCount">0</strong>
+            <span>Antworten eingegangen</span>
+            <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="closedState" class="state-panel center-state hidden">
+        <div class="state-icon">✓</div>
+        <h1 class="state-title">Antworten gespeichert</h1>
+        <p class="instruction">Zeit für die Auflösung.</p>
+      </section>
+
+      <section id="solutionState" class="state-panel center-state hidden">
+        <p class="solution-label">Die richtige Antwort lautet</p>
+        <div class="solution-value"><strong id="solutionValue"></strong><span id="solutionUnit"></span></div>
+        <p class="solution-explanation" id="solutionExplanation"></p>
+      </section>
+
+      <section id="rankingState" class="state-panel center-state hidden">
+        <p class="solution-label">Finale Rangliste</p>
+        <h1 class="ranking-title">Unsere Quiz-Champions</h1>
+        <ol class="presenter-ranking" id="presenterRanking"></ol>
+      </section>
+    </section>
+
+    <div class="connection-warning hidden" id="connectionWarning">Verbindung wird erneut aufgebaut …</div>
+  </main>
+
+  <script src="lib/supabase.js"></script>
+  <script src="js/config.js"></script>
+  <script src="js/app.js"></script>
+  <script src="js/live.js"></script>
+  <script>
+    (function () {
+      "use strict";
+
+      const stage = document.getElementById("quizStage");
+      const stateIds = ["loadingState", "lobbyState", "questionState", "closedState", "solutionState", "rankingState"];
+      const warning = document.getElementById("connectionWarning");
+      let currentState = null;
+      let timerId = null;
+      let rankingRevision = null;
+
+      function show(id) {
+        stateIds.forEach(stateId => document.getElementById(stateId).classList.toggle("hidden", stateId !== id));
+      }
+
+      function setMeta(state) {
+        if (!state.question_count || ["setup", "lobby", "ranking"].includes(state.status)) {
+          document.getElementById("questionNumber").textContent = "Live-Quiz";
+          document.getElementById("roundTitle").textContent = "Fachdienst im Dialog";
+          return;
+        }
+        document.getElementById("questionNumber").textContent = `Frage ${state.current_question} von ${state.question_count}`;
+        document.getElementById("roundTitle").textContent = state.round_title || "Unser Fachdienst";
+      }
+
+      function updateProgress(state) {
+        const answers = Number(state.answer_count || 0);
+        const players = Math.max(1, Number(state.player_count || 0));
+        document.getElementById("answerCount").textContent = answers;
+        document.getElementById("progressFill").style.width = `${Math.min(100, answers / players * 100)}%`;
+      }
+
+      function stopTimer() {
+        if (timerId) window.clearInterval(timerId);
+        timerId = null;
+      }
+
+      function runTimer(state) {
+        stopTimer();
+        const timer = document.getElementById("timer");
+        const countdown = document.getElementById("countdown");
+
+        const tick = () => {
+          const deadline = Date.parse(state.answer_deadline || "");
+          const remaining = Number.isFinite(deadline)
+            ? Math.max(0, Math.ceil((deadline - Date.now()) / 1000))
+            : Number(state.duration_seconds || 30);
+          countdown.textContent = remaining;
+          timer.classList.toggle("ending", remaining <= 10);
+          if (remaining <= 0) {
+            stopTimer();
+            show("closedState");
+          }
+        };
+
+        tick();
+        timerId = window.setInterval(tick, 250);
+      }
+
+      async function renderRanking(state) {
+        show("rankingState");
+        if (rankingRevision === state.revision) return;
+        rankingRevision = state.revision;
+        try {
+          const rows = await QuizLive.getRanking();
+          const list = document.getElementById("presenterRanking");
+          list.replaceChildren();
+          rows.slice(0, 5).forEach(row => {
+            const item = document.createElement("li");
+            const place = document.createElement("span");
+            const name = document.createElement("strong");
+            const points = document.createElement("em");
+            place.textContent = row.place;
+            name.textContent = row.nickname;
+            points.textContent = `${QuizUtils.formatNumber(row.total_points)} Punkte`;
+            item.append(place, name, points);
+            list.appendChild(item);
+          });
+        } catch (error) {
+          warning.textContent = QuizUtils.errorMessage(error);
+          warning.classList.remove("hidden");
+        }
+      }
+
+      function render(state) {
+        currentState = state;
+        warning.classList.add("hidden");
+        setMeta(state);
+        updateProgress(state);
+
+        if (state.background && !["setup", "lobby", "ranking"].includes(state.status)) {
+          QuizUtils.setBackground(stage, state.background, "assets/backgrounds/presenter-base.png");
+        } else {
+          QuizUtils.setBackground(stage, "assets/backgrounds/presenter-base.png");
+        }
+
+        if (state.status === "setup") {
+          stopTimer();
+          document.querySelector("#loadingState .state-title").textContent = "Das Quiz wird vorbereitet …";
+          show("loadingState");
+        } else if (state.status === "lobby") {
+          stopTimer();
+          document.getElementById("lobbyPlayers").textContent = state.player_count || 0;
+          show("lobbyState");
+        } else if (state.status === "question" || state.status === "accepting") {
+          document.getElementById("questionText").textContent = state.question_text || "";
+          document.getElementById("presenterInstruction").textContent = state.status === "accepting"
+            ? "Schätzung jetzt auf dem Smartphone abgeben."
+            : "Die Antwortzeit startet gleich.";
+          if (state.status === "accepting") {
+            runTimer(state);
+          } else {
+            stopTimer();
+            document.getElementById("countdown").textContent = state.duration_seconds || 30;
+            document.getElementById("timer").classList.remove("ending");
+          }
+          show("questionState");
+        } else if (state.status === "closed") {
+          stopTimer();
+          show("closedState");
+        } else if (state.status === "solution") {
+          stopTimer();
+          document.getElementById("solutionValue").textContent = QuizUtils.formatNumber(state.correct_answer);
+          document.getElementById("solutionUnit").textContent = state.unit || "";
+          document.getElementById("solutionExplanation").textContent = state.explanation || "";
+          show("solutionState");
+        } else if (state.status === "ranking") {
+          stopTimer();
+          renderRanking(state);
+        }
+      }
+
+      QuizLive.subscribeState(render, error => {
+        warning.textContent = QuizUtils.errorMessage(error);
+        warning.classList.remove("hidden");
+      });
+    })();
+  </script>
+</body>
+</html>

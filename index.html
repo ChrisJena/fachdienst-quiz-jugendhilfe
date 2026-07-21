@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Fachdienst im Dialog – Mitspielen</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body class="app-page">
+  <main class="mobile-screen" id="screen">
+    <section class="app-card">
+      <div id="loadingView">
+        <span class="app-status">Fachdienst im Dialog</span>
+        <h1>Quiz wird verbunden …</h1>
+        <p>Die Live-Verbindung wird aufgebaut.</p>
+      </div>
+
+      <div id="joinView" class="hidden">
+        <span class="app-status">Fachdienst im Dialog · 02.09.2026</span>
+        <h1>Wie gut kenne ich meinen Fachdienst?</h1>
+        <p id="joinHint">Gib einen Namen oder Spitznamen ein und spiele mit.</p>
+        <input id="playerName" maxlength="24" autocomplete="nickname" placeholder="Name oder Spitzname">
+        <button id="joinButton" type="button">Am Quiz teilnehmen</button>
+      </div>
+
+      <div id="waitingView" class="hidden">
+        <span class="app-status" id="waitingStatus">Du bist dabei</span>
+        <h2 id="waitingTitle">Bitte auf die nächste Frage warten.</h2>
+        <p id="welcomeText"></p>
+      </div>
+
+      <div id="questionView" class="hidden">
+        <span class="app-status" id="questionNumber"></span>
+        <h2 id="questionText"></h2>
+        <p class="question-hint" id="questionHint">Deine Schätzung:</p>
+        <input id="guessInput" type="number" step="1" inputmode="numeric" placeholder="Deine Schätzung">
+        <button id="submitGuess" type="button">Schätzung abgeben</button>
+      </div>
+
+      <div id="submittedView" class="hidden">
+        <span class="app-status">Antwort gespeichert</span>
+        <h2>Danke!</h2>
+        <p>Bitte blicke wieder auf die Präsentationsfläche.</p>
+      </div>
+
+      <div id="solutionView" class="hidden">
+        <span class="app-status">Auflösung</span>
+        <p class="mobile-solution-label">Die richtige Antwort lautet</p>
+        <h2 class="mobile-solution" id="mobileSolution"></h2>
+        <p id="mobileExplanation"></p>
+      </div>
+
+      <div id="rankingView" class="hidden">
+        <span class="app-status">Finale Rangliste</span>
+        <h2>Das Ergebnis steht fest!</h2>
+        <p class="own-rank" id="ownRank"></p>
+        <ol class="mobile-ranking" id="mobileRanking"></ol>
+      </div>
+
+      <p class="app-message" id="appMessage" role="alert" aria-live="polite"></p>
+    </section>
+  </main>
+
+  <script src="lib/xlsx.full.min.js"></script>
+  <script src="lib/supabase.js"></script>
+  <script src="js/config.js"></script>
+  <script src="js/app.js"></script>
+  <script src="js/live.js"></script>
+  <script>
+    (function () {
+      "use strict";
+
+      const SESSION_KEY = "fdQuizParticipant";
+      const ANSWERED_KEY = "fdQuizAnsweredQuestions";
+      const viewIds = ["loadingView", "joinView", "waitingView", "questionView", "submittedView", "solutionView", "rankingView"];
+      const screen = document.getElementById("screen");
+      const message = document.getElementById("appMessage");
+      const joinButton = document.getElementById("joinButton");
+      const submitButton = document.getElementById("submitGuess");
+      let participant = null;
+      let state = null;
+      let renderedQuestion = null;
+      let rankingLoaded = false;
+      let rankingLoading = false;
+
+      function show(id) {
+        viewIds.forEach(view => document.getElementById(view).classList.toggle("hidden", view !== id));
+      }
+
+      function setMessage(value, isError = false) {
+        message.textContent = value || "";
+        message.classList.toggle("error", isError && Boolean(value));
+      }
+
+      function readJson(key, fallback) {
+        try { return JSON.parse(localStorage.getItem(key)) || fallback; }
+        catch (_) { return fallback; }
+      }
+
+      function answeredQuestions() {
+        return readJson(ANSWERED_KEY, []);
+      }
+
+      function markAnswered(number) {
+        const values = new Set(answeredQuestions());
+        values.add(Number(number));
+        localStorage.setItem(ANSWERED_KEY, JSON.stringify([...values]));
+      }
+
+      function hasAnswered(number) {
+        return answeredQuestions().includes(Number(number));
+      }
+
+      function saveParticipant(value) {
+        participant = value;
+        localStorage.setItem(SESSION_KEY, JSON.stringify(value));
+      }
+
+      function clearParticipant() {
+        participant = null;
+        localStorage.removeItem(SESSION_KEY);
+        localStorage.removeItem(ANSWERED_KEY);
+      }
+
+      function setWaiting(status, title, text) {
+        document.getElementById("waitingStatus").textContent = status;
+        document.getElementById("waitingTitle").textContent = title;
+        document.getElementById("welcomeText").textContent = text || "";
+        show("waitingView");
+      }
+
+      function renderQuestion(currentState, accepting) {
+        const number = Number(currentState.current_question);
+        if (renderedQuestion !== number) {
+          renderedQuestion = number;
+          document.getElementById("guessInput").value = "";
+        }
+        QuizUtils.setBackground(screen, currentState.background);
+        document.getElementById("questionNumber").textContent = `Frage ${number} von ${currentState.question_count}`;
+        document.getElementById("questionText").textContent = currentState.question_text || "Die nächste Frage wird vorbereitet.";
+        document.getElementById("questionHint").textContent = accepting
+          ? "Deine Schätzung:"
+          : "Die Antwortzeit startet gleich.";
+        document.getElementById("guessInput").disabled = !accepting;
+        submitButton.disabled = !accepting;
+        show("questionView");
+      }
+
+      async function renderRanking() {
+        show("rankingView");
+        if (rankingLoaded || rankingLoading) return;
+        rankingLoading = true;
+        try {
+          const rows = await QuizLive.getRanking();
+          const list = document.getElementById("mobileRanking");
+          list.replaceChildren();
+          rows.slice(0, 10).forEach(row => {
+            const item = document.createElement("li");
+            const name = document.createElement("span");
+            const points = document.createElement("strong");
+            name.textContent = `${row.place}. ${row.nickname}`;
+            points.textContent = `${QuizUtils.formatNumber(row.total_points)} Punkte`;
+            item.append(name, points);
+            list.appendChild(item);
+          });
+          const own = participant ? rows.find(row => row.nickname === participant.nickname) : null;
+          document.getElementById("ownRank").textContent = own
+            ? `Dein Platz: ${own.place} · ${QuizUtils.formatNumber(own.total_points)} Punkte`
+            : "Die besten zehn Platzierungen:";
+          rankingLoaded = true;
+        } catch (error) {
+          setMessage(QuizUtils.errorMessage(error), true);
+        } finally {
+          rankingLoading = false;
+        }
+      }
+
+      function render(currentState) {
+        state = currentState;
+        setMessage("");
+
+        if (currentState.status === "ranking") {
+          renderRanking();
+          return;
+        }
+
+        if (!participant) {
+          document.getElementById("joinButton").disabled = currentState.status === "setup";
+          document.getElementById("joinHint").textContent = currentState.status === "setup"
+            ? "Die Moderation bereitet das Quiz gerade vor. Gleich geht es los."
+            : "Gib einen Namen oder Spitznamen ein und spiele mit.";
+          show("joinView");
+          return;
+        }
+
+        const name = participant.nickname;
+        if (currentState.status === "setup") {
+          setWaiting("Quiz wird vorbereitet", "Gleich geht es los.", `${name}, du wirst automatisch verbunden.`);
+        } else if (currentState.status === "lobby") {
+          setWaiting("Du bist dabei", "Bitte auf die erste Frage warten.", `Willkommen, ${name}!`);
+        } else if (currentState.status === "question") {
+          renderQuestion(currentState, false);
+        } else if (currentState.status === "accepting") {
+          const deadline = currentState.answer_deadline ? Date.parse(currentState.answer_deadline) : 0;
+          if (hasAnswered(currentState.current_question)) {
+            show("submittedView");
+          } else if (deadline && Date.now() > deadline + 1500) {
+            setWaiting("Zeit abgelaufen", "Diese Runde ist geschlossen.", "Bitte blicke wieder auf die Präsentationsfläche.");
+          } else {
+            renderQuestion(currentState, true);
+          }
+        } else if (currentState.status === "closed") {
+          if (hasAnswered(currentState.current_question)) show("submittedView");
+          else setWaiting("Antworten geschlossen", "Zeit für die Auflösung.", "Bitte blicke auf die Präsentationsfläche.");
+        } else if (currentState.status === "solution") {
+          document.getElementById("mobileSolution").textContent = `${QuizUtils.formatNumber(currentState.correct_answer)} ${currentState.unit || ""}`.trim();
+          document.getElementById("mobileExplanation").textContent = currentState.explanation || "";
+          show("solutionView");
+        }
+      }
+
+      joinButton.addEventListener("click", async () => {
+        const nickname = document.getElementById("playerName").value.trim();
+        if (!nickname) return setMessage("Bitte gib einen Namen oder Spitznamen ein.", true);
+        joinButton.disabled = true;
+        setMessage("Teilnahme wird eingerichtet …");
+        try {
+          const rows = await QuizLive.join(nickname);
+          if (!rows || !rows.length) throw new Error("Die Teilnahme konnte nicht angelegt werden.");
+          const row = rows[0];
+          saveParticipant({ id: row.participant_id, accessToken: row.access_token, nickname: row.nickname });
+          setMessage("");
+          render(state);
+        } catch (error) {
+          setMessage(QuizUtils.errorMessage(error), true);
+        } finally {
+          joinButton.disabled = state && state.status === "setup";
+        }
+      });
+
+      document.getElementById("playerName").addEventListener("keydown", event => {
+        if (event.key === "Enter") joinButton.click();
+      });
+
+      submitButton.addEventListener("click", async () => {
+        const input = document.getElementById("guessInput");
+        if (input.value === "" || !Number.isInteger(Number(input.value))) {
+          return setMessage("Bitte gib eine ganze Zahl ein.", true);
+        }
+        submitButton.disabled = true;
+        setMessage("Antwort wird gespeichert …");
+        try {
+          await QuizLive.submit(participant.id, participant.accessToken, Number(input.value));
+          markAnswered(state.current_question);
+          setMessage("");
+          show("submittedView");
+        } catch (error) {
+          const text = QuizUtils.errorMessage(error);
+          if (text.includes("bereits eine Antwort")) {
+            markAnswered(state.current_question);
+            setMessage("");
+            show("submittedView");
+          } else {
+            setMessage(text, true);
+            submitButton.disabled = false;
+          }
+        }
+      });
+
+      async function restoreParticipant() {
+        const saved = readJson(SESSION_KEY, null);
+        if (!saved || !saved.accessToken) return;
+        try {
+          const rows = await QuizLive.resume(saved.accessToken);
+          if (rows && rows.length) {
+            participant = { id: rows[0].participant_id, accessToken: saved.accessToken, nickname: rows[0].nickname };
+            localStorage.setItem(SESSION_KEY, JSON.stringify(participant));
+          } else {
+            clearParticipant();
+          }
+        } catch (_) {
+          clearParticipant();
+        }
+      }
+
+      async function initialize() {
+        try {
+          await restoreParticipant();
+          QuizLive.subscribeState(render, error => setMessage(QuizUtils.errorMessage(error), true));
+        } catch (error) {
+          QuizUtils.showLoadError(error, screen);
+        }
+      }
+
+      initialize();
+    })();
+  </script>
+</body>
+</html>
